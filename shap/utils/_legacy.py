@@ -109,7 +109,7 @@ def match_model_to_data(model, data):
         if isinstance(data, DenseDataWithIndex):
             out_val = model.f(data.convert_to_df())
         else:
-            out_val = model.f(data.data)
+            out_val = model.f(data)
     except:
         print("Provided model function fails when applied to the provided data set.")
         raise
@@ -121,7 +121,6 @@ def match_model_to_data(model, data):
             model.out_names = ["output value "+str(i) for i in range(out_val.shape[0])]
     
     return out_val
-
 
 
 class Data:
