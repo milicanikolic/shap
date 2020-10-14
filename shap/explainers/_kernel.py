@@ -12,9 +12,11 @@ import warnings
 from sklearn.linear_model import LassoLarsIC, Lasso, lars_path
 from tqdm.auto import tqdm
 from ._explainer import Explainer
+import re
 
 log = logging.getLogger('shap')
 
+PATTERN = re.compile(r'''((?:[^,"']|"[^"]*"|'[^']*')+)''')
 
 
 class Kernel(Explainer):
@@ -51,21 +53,19 @@ class Kernel(Explainer):
         sense to connect them to the output with a link function where link(output) = sum(phi).
         If the model output is a probability then the LogitLink link function makes the feature
         importance values have log-odds units.
-
-    Examples
-    --------
-    See :ref:`Kernel Explainer Examples <kernel_explainer_examples>`
     """
 
     def __init__(self, model, data, link=IdentityLink(), **kwargs):
 
         # convert incoming inputs to standardized iml objects
         self.link = convert_to_link(link)
-        self.model = convert_to_model(model)
+        self.model = convert_to_model(model.predict)
+        self.categories = kwargs.get("categories", {})
+        self.categorical_columns = kwargs.get("categorical", [])
         self.keep_index = kwargs.get("keep_index", False)
         self.keep_index_ordered = kwargs.get("keep_index_ordered", False)
         self.data = convert_to_data(data, keep_index=self.keep_index)
-        model_null = match_model_to_data(self.model, self.data)
+        model_null = match_model_to_data(self.model, data)
 
         # enforce our current input type limitations
         assert isinstance(self.data, DenseData) or isinstance(self.data, SparseData), \
@@ -101,7 +101,6 @@ class Kernel(Explainer):
         else:
             self.D = self.fnull.shape[0]
 
-
     def shap_values(self, X, **kwargs):
         """ Estimate the SHAP values for a set of samples.
 
@@ -126,14 +125,13 @@ class Kernel(Explainer):
 
         Returns
         -------
-        array or list
-            For models with a single output this returns a matrix of SHAP values
-            (# samples x # features). Each row sums to the difference between the model output for that
-            sample and the expected value of the model output (which is stored as expected_value
-            attribute of the explainer). For models with vector outputs this returns a list
-            of such matrices, one for each output.
+        For models with a single output this returns a matrix of SHAP values
+        (# samples x # features). Each row sums to the difference between the model output for that
+        sample and the expected value of the model output (which is stored as expected_value
+        attribute of the explainer). For models with vector outputs this returns a list
+        of such matrices, one for each output.
         """
-
+        self.keep_index = True
         # convert dataframes
         if str(type(X)).endswith("pandas.core.series.Series'>"):
             X = X.values
@@ -222,7 +220,15 @@ class Kernel(Explainer):
 
         # find f(x)
         if self.keep_index:
-            model_out = self.model.f(instance.convert_to_df())
+            df = instance.convert_to_df()
+            level0 = PATTERN.split(df.index.format()[0][1:-1])[1::2][0]
+            level1 = pd.to_datetime(PATTERN.split(df.index.format()[0][1:-1])[1::2][1], format="%Y-%m-%d")
+            df[level0] = level0
+            df[level1] = level1
+            for column in self.categorical_columns:
+                df[column] = pd.Categorical(df[column], categories=self.categories[column])
+            df.set_index([level0, level1], inplace=True)
+            model_out = self.model.f(df)
         else:
             model_out = self.model.f(instance.x)
         if isinstance(model_out, (pd.DataFrame, pd.Series)):
@@ -504,7 +510,16 @@ class Kernel(Explainer):
             index = self.synth_data_index[self.nsamplesRun*self.N:self.nsamplesAdded*self.N]
             index = pd.DataFrame(index, columns=[self.data.index_name])
             data = pd.DataFrame(data, columns=self.data.group_names)
-            data = pd.concat([index, data], axis=1).set_index(self.data.index_name)
+            data = pd.concat([index, data], axis=1)
+            data = data.set_index(self.data.index_name)
+            for column in self.categorical_columns:
+                data[column] = pd.Categorical(data[column], categories=self.categories[column])
+            level0 = PATTERN.split(data.index.format()[0][1:-1])[1::2][0]
+            level1 = pd.to_datetime(PATTERN.split(data.index.format()[0][1:-1])[1::2][1], format="%Y-%m-%d")
+            data[level0] = level0
+            data[level1] = level1
+            data.set_index([level0, level1], inplace=True)
+
             if self.keep_index_ordered:
                 data = data.sort_index()
         modelOut = self.model.f(data)
@@ -568,18 +583,7 @@ class Kernel(Explainer):
 
         # solve a weighted least squares equation to estimate phi
         tmp = np.transpose(np.transpose(etmp) * np.transpose(self.kernelWeights))
-        etmp_dot = np.dot(np.transpose(tmp), etmp)
-        try:
-            tmp2 = np.linalg.inv(etmp_dot)
-        except np.linalg.LinAlgError:
-            tmp2 = np.linalg.pinv(etmp_dot)
-            warnings.warn(
-                "Linear regression equation is singular, Moore-Penrose pseudoinverse is used instead of the regular inverse.\n"
-                "To use regular inverse do one of the following:\n"
-                "1) turn up the number of samples,\n"
-                "2) turn up the L1 regularization with num_features(N) where N is less than the number of samples,\n"
-                "3) group features together to reduce the number of inputs that need to be explained."
-            )
+        tmp2 = np.linalg.inv(np.dot(np.transpose(tmp), etmp))
         w = np.dot(tmp2, np.dot(np.transpose(tmp), eyAdj2))
         log.debug("np.sum(w) = {0}".format(np.sum(w)))
         log.debug("self.link(self.fx) - self.link(self.fnull) = {0}".format(
